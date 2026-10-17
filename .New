@@ -1,0 +1,1024 @@
+#include "esp_camera.h"
+#include "img_converters.h"
+#include <WiFi.h>
+#include <esp_http_server.h>
+#include <SD_MMC.h>
+#include <FS.h>
+#include <Preferences.h>
+#include <esp_arduino_version.h>
+
+// =====================================================
+// ESP32-CAM AI-THINKER - CAMERA CONTROL STATION
+// Features: live stream, snapshots, SD storage, timelapse,
+// auto night light, persistent settings, status monitoring.
+// =====================================================
+
+// ---------------- USER SETTINGS ----------------
+const char *AP_SSID = "ESP32-CAM-AP";
+const char *AP_PASS = "12345678"; // Change before use
+
+IPAddress apIP(192, 168, 4, 1);
+IPAddress apGateway(192, 168, 4, 1);
+IPAddress apSubnet(255, 255, 255, 0);
+
+#define FLASH_PIN 4
+#define FLASH_CH  4
+
+// AI-Thinker ESP32-CAM pin map
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ---------------- GLOBAL STATE ----------------
+enum { LIGHT_OFF = 0, LIGHT_ON = 1, LIGHT_AUTO = 2 };
+
+volatile uint8_t lightMode = LIGHT_AUTO;
+volatile uint8_t lightLevel = 40;
+volatile uint8_t darkThreshold = 35;
+volatile bool ledIsOn = false;
+volatile int lastBrightness = -1;
+
+volatile bool tlRunning = false;
+volatile uint32_t tlInterval = 10;
+volatile uint32_t tlCount = 0;
+
+bool sdOK = false;
+uint32_t cardMB = 0;
+uint32_t bootNum = 0;
+uint32_t snapNum = 0;
+uint32_t tlNum = 0;
+uint32_t bootMillis = 0;
+
+framesize_t maxFrame = FRAMESIZE_VGA;
+
+SemaphoreHandle_t sdLock = nullptr;
+httpd_handle_t mainServer = nullptr;
+httpd_handle_t streamServer = nullptr;
+
+Preferences prefs;
+
+// ---------------- FLASH LED COMPATIBILITY ----------------
+void initFlashPWM() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(FLASH_PIN, 5000, 8);
+#else
+  ledcSetup(FLASH_CH, 5000, 8);
+  ledcAttachPin(FLASH_PIN, FLASH_CH);
+#endif
+}
+
+void writeFlashPWM(uint8_t duty) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(FLASH_PIN, duty);
+#else
+  ledcWrite(FLASH_CH, duty);
+#endif
+}
+
+void setLed(bool on) {
+  writeFlashPWM(on ? lightLevel : 0);
+  ledIsOn = on;
+}
+
+void applyLight() {
+  if (lightMode == LIGHT_ON) setLed(true);
+  else if (lightMode == LIGHT_OFF) setLed(false);
+  else if (ledIsOn) setLed(true);
+}
+
+// ---------------- PERSISTENT SETTINGS ----------------
+void loadSettings() {
+  prefs.begin("camsettings", false);
+
+  lightMode = prefs.getUChar("lightMode", LIGHT_AUTO);
+  lightLevel = prefs.getUChar("lightLevel", 40);
+  darkThreshold = prefs.getUChar("darkThr", 35);
+  tlInterval = prefs.getUInt("tlInterval", 10);
+
+  lightMode = constrain(lightMode, LIGHT_OFF, LIGHT_AUTO);
+  lightLevel = constrain(lightLevel, 1, 255);
+  darkThreshold = constrain(darkThreshold, 5, 120);
+  tlInterval = constrain(tlInterval, 1, 3600);
+}
+
+void saveSettings() {
+  prefs.putUChar("lightMode", lightMode);
+  prefs.putUChar("lightLevel", lightLevel);
+  prefs.putUChar("darkThr", darkThreshold);
+  prefs.putUInt("tlInterval", tlInterval);
+}
+
+void loadCameraSettings(sensor_t *s) {
+  int fs = prefs.getInt("framesize", -1);
+  int quality = prefs.getInt("quality", 10);
+  int vf = prefs.getInt("vflip", 0);
+  int hm = prefs.getInt("hmirror", 0);
+
+  if (fs >= FRAMESIZE_QVGA && fs <= maxFrame) {
+    s->set_framesize(s, (framesize_t)fs);
+  }
+  s->set_quality(s, constrain(quality, 6, 40));
+  s->set_vflip(s, vf ? 1 : 0);
+  s->set_hmirror(s, hm ? 1 : 0);
+}
+
+// ---------------- HTTP HELPERS ----------------
+static bool getParam(httpd_req_t *req, const char *key,
+                     char *out, size_t outLen) {
+  char query[192];
+
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK)
+    return false;
+
+  return httpd_query_key_value(query, key, out, outLen) == ESP_OK;
+}
+
+static void addUri(httpd_handle_t h, const char *uri,
+                   esp_err_t (*fn)(httpd_req_t *)) {
+  httpd_uri_t u = {};
+  u.uri = uri;
+  u.method = HTTP_GET;
+  u.handler = fn;
+  u.user_ctx = nullptr;
+  httpd_register_uri_handler(h, &u);
+}
+
+// ---------------- WEB CONTROL PANEL ----------------
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-CAM Control Station</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#10131a;color:#eee;
+margin:auto;padding:14px;max-width:760px}
+h2{color:#8cf}
+fieldset{border:1px solid #394252;border-radius:10px;margin:12px 0;padding:12px}
+legend{color:#8cf;padding:0 6px}
+button{padding:9px 13px;border:0;border-radius:6px;
+background:#187c65;color:white;margin:3px;cursor:pointer}
+button.gray{background:#48505c}
+select,input{font-size:15px;margin:4px}
+label{display:block;margin:9px 0}
+img{width:100%;height:auto;min-height:140px;background:#000;border-radius:8px}
+a{color:#8cf}
+.small{font-size:13px;color:#b9c2ce;line-height:1.6}
+input[type=range]{max-width:100%}
+</style>
+</head>
+<body>
+<h2>ESP32-CAM Control Station</h2>
+<img id="v" alt="Camera stream appears here">
+
+<div>
+<button onclick="stream(1)">Start stream</button>
+<button class="gray" onclick="stream(0)">Stop stream</button>
+<button onclick="savePhoto()">Save photo</button>
+<button class="gray" onclick="location.href='/capture'">Snapshot</button>
+</div>
+
+<p class="small" id="msg">Ready</p>
+<p class="small">
+<a href="/list?dir=photos">Browse photos</a> |
+<a href="/list?dir=timelapse">Browse timelapse</a>
+</p>
+
+<fieldset>
+<legend>Camera settings</legend>
+<label>Resolution
+<select id="fs" onchange="ctl('framesize',this.value)">
+<option value="5">QVGA 320x240</option>
+<option value="6">CIF 400x296</option>
+<option value="8">VGA 640x480</option>
+<option value="9">SVGA 800x600</option>
+<option value="10">XGA 1024x768</option>
+<option value="11">HD 1280x720</option>
+<option value="12">SXGA 1280x1024</option>
+<option value="13">UXGA 1600x1200</option>
+</select></label>
+<label>JPEG quality (lower is better)
+<input id="q" type="range" min="6" max="40"
+onchange="ctl('quality',this.value)">
+<span id="qv"></span></label>
+<label><input id="vf" type="checkbox"
+onchange="ctl('vflip',this.checked?1:0)"> Vertical flip</label>
+<label><input id="hm" type="checkbox"
+onchange="ctl('hmirror',this.checked?1:0)"> Horizontal mirror</label>
+</fieldset>
+
+<fieldset>
+<legend>Night light</legend>
+<label>Mode
+<select id="lm" onchange="ctl('light_mode',this.value)">
+<option value="0">Off</option>
+<option value="1">Always on</option>
+<option value="2">Automatic</option>
+</select></label>
+<label>LED brightness
+<input id="ll" type="range" min="1" max="255"
+onchange="ctl('light_level',this.value)">
+<span id="llv"></span></label>
+<label>Auto mode darkness threshold
+<input id="dt" type="range" min="5" max="120"
+onchange="ctl('dark_thr',this.value)">
+<span id="dtv"></span></label>
+<p class="small" id="ls"></p>
+</fieldset>
+
+<fieldset>
+<legend>Timelapse</legend>
+<label>Interval in seconds
+<input id="ti" type="number" min="1" max="3600" value="10"
+style="width:100px" onchange="ctl('tl_interval',this.value)">
+</label>
+<button onclick="ctl('tl',1)">Start timelapse</button>
+<button class="gray" onclick="ctl('tl',0)">Stop timelapse</button>
+<p class="small" id="ts"></p>
+</fieldset>
+
+<fieldset>
+<legend>System status</legend>
+<p class="small" id="st">Loading status...</p>
+<button class="gray" onclick="poll()">Refresh status</button>
+</fieldset>
+
+<script>
+const $=id=>document.getElementById(id);
+let first=true;
+
+async function ctl(v,x){
+  try{
+    const r=await fetch('/control?var='+encodeURIComponent(v)+
+      '&val='+encodeURIComponent(x));
+    const t=await r.text();
+    $('msg').textContent=r.ok?'Updated: '+v:'Error: '+t;
+    if(r.ok) poll();
+  }catch(e){$('msg').textContent='Request failed';}
+}
+
+function stream(on){
+  $('v').src=on?'http://'+location.hostname+':81/stream?t='+Date.now():'';
+  $('msg').textContent=on?'Starting stream...':'Stream stopped';
+}
+
+async function savePhoto(){
+  $('msg').textContent='Saving photo...';
+  try{
+    const r=await fetch('/save');
+    $('msg').textContent=await r.text();
+  }catch(e){$('msg').textContent='Save request failed';}
+}
+
+async function poll(){
+  try{
+    const r=await fetch('/status?t='+Date.now());
+    const s=await r.json();
+
+    if(first){
+      first=false;
+      $('fs').value=s.framesize;
+      $('q').value=s.quality;
+      $('vf').checked=!!s.vflip;
+      $('hm').checked=!!s.hmirror;
+      $('lm').value=s.lightMode;
+      $('ll').value=s.lightLevel;
+      $('dt').value=s.darkThr;
+      $('ti').value=s.tlInterval;
+    }
+
+    $('qv').textContent=$('q').value;
+    $('llv').textContent=$('ll').value;
+    $('dtv').textContent=$('dt').value;
+
+    $('st').textContent=
+      'SD card: '+(s.sd?s.cardMB+' MB':'not detected')+
+      ' | Photos this boot: '+s.snaps+
+      ' | Free heap: '+Math.round(s.heap/1024)+' KB'+
+      ' | Free PSRAM: '+Math.round(s.psram/1024)+' KB'+
+      ' | Uptime: '+s.uptime+' seconds'+
+      ' | Wi-Fi clients: '+s.clients;
+
+    $('ls').textContent='Flash LED: '+(s.led?'ON':'OFF')+
+      ' | Last brightness reading: '+s.brightness;
+
+    $('ts').textContent=s.tl?
+      'Running | Frames saved: '+s.tlCount:
+      'Stopped | Frames saved: '+s.tlCount;
+  }catch(e){
+    $('st').textContent='Unable to retrieve status';
+  }
+}
+
+poll();
+setInterval(poll,3000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ---------------- SD CARD STORAGE ----------------
+void initSD() {
+  // 1-bit mode leaves GPIO4 available for the flash LED.
+  if (!SD_MMC.begin("/sdcard", true)) {
+    Serial.println("SD mount failed; camera will run without SD.");
+    return;
+  }
+
+  if (SD_MMC.cardType() == CARD_NONE) {
+    Serial.println("No SD card detected.");
+    return;
+  }
+
+  SD_MMC.mkdir("/photos");
+  SD_MMC.mkdir("/timelapse");
+
+  cardMB = (uint32_t)(SD_MMC.cardSize() / (1024ULL * 1024ULL));
+  sdOK = true;
+
+  Serial.printf("SD card ready: %u MB\n", (unsigned)cardMB);
+}
+
+bool savePhoto(const char *dir, const char *prefix,
+               uint32_t n, char *name, size_t nameLen) {
+  if (!sdOK || sdLock == nullptr) return false;
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed.");
+    return false;
+  }
+
+  snprintf(name, nameLen, "%s/%s_%03u_%05u.jpg",
+           dir, prefix, (unsigned)bootNum, (unsigned)n);
+
+  bool ok = false;
+
+  if (xSemaphoreTake(sdLock, pdMS_TO_TICKS(5000)) == pdTRUE) {
+    File f = SD_MMC.open(name, FILE_WRITE);
+
+    if (f) {
+      size_t written = f.write(fb->buf, fb->len);
+      f.close();
+      ok = (written == fb->len);
+    }
+
+    xSemaphoreGive(sdLock);
+  }
+
+  esp_camera_fb_return(fb);
+
+  if (!ok) Serial.printf("Failed to save %s\n", name);
+  return ok;
+}
+
+// ---------------- BRIGHTNESS MEASUREMENT ----------------
+int measureBrightness() {
+  if (!psramFound()) return -1;
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) return -1;
+
+  int result = -1;
+  size_t pixels = (size_t)fb->width * fb->height;
+
+  uint8_t *rgb = (uint8_t *)ps_malloc(pixels * 3);
+
+  if (rgb) {
+    if (fmt2rgb888(fb->buf, fb->len, fb->format, rgb)) {
+      uint64_t sum = 0;
+      uint32_t count = 0;
+
+      // Sample every 16th pixel to reduce CPU work.
+      for (size_t p = 0; p < pixels; p += 16) {
+        size_t i = p * 3;
+        sum += rgb[i] + rgb[i + 1] + rgb[i + 2];
+        count += 3;
+      }
+
+      if (count) result = (int)(sum / count);
+    }
+
+    free(rgb);
+  }
+
+  esp_camera_fb_return(fb);
+  return result;
+}
+
+// ---------------- HTTP HANDLERS ----------------
+esp_err_t indexHandler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "text/html; charset=utf-8");
+  return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
+esp_err_t captureHandler(httpd_req_t *req) {
+  camera_fb_t *fb = esp_camera_fb_get();
+
+  if (!fb) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  httpd_resp_set_type(req, "image/jpeg");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  httpd_resp_set_hdr(req, "Content-Disposition",
+                     "inline; filename=capture.jpg");
+
+  esp_err_t res = httpd_resp_send(
+    req, (const char *)fb->buf, fb->len);
+
+  esp_camera_fb_return(fb);
+  return res;
+}
+
+static const char *STREAM_CT =
+  "multipart/x-mixed-replace;boundary=frame123";
+static const char *STREAM_BOUNDARY = "\r\n--frame123\r\n";
+static const char *STREAM_PART =
+  "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+esp_err_t streamHandler(httpd_req_t *req) {
+  esp_err_t res = httpd_resp_set_type(req, STREAM_CT);
+  if (res != ESP_OK) return res;
+
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+  char part[80];
+
+  while (true) {
+    camera_fb_t *fb = esp_camera_fb_get();
+
+    if (!fb) {
+      res = ESP_FAIL;
+      break;
+    }
+
+    res = httpd_resp_send_chunk(
+      req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
+
+    if (res == ESP_OK) {
+      size_t len = snprintf(part, sizeof(part), STREAM_PART,
+                            (unsigned)fb->len);
+      res = httpd_resp_send_chunk(req, part, len);
+    }
+
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(
+        req, (const char *)fb->buf, fb->len);
+    }
+
+    esp_camera_fb_return(fb);
+
+    if (res != ESP_OK) break;
+    vTaskDelay(1);
+  }
+
+  return res;
+}
+
+esp_err_t saveHandler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "text/plain");
+
+  if (!sdOK) {
+    return httpd_resp_sendstr(req, "No SD card found.");
+  }
+
+  char name[64];
+  char msg[100];
+
+  uint32_t id = ++snapNum;
+
+  if (savePhoto("/photos", "snap", id, name, sizeof(name))) {
+    snprintf(msg, sizeof(msg), "Saved photo: %s", name);
+  } else {
+    snprintf(msg, sizeof(msg), "Photo save failed. Check SD card.");
+  }
+
+  return httpd_resp_sendstr(req, msg);
+}
+
+esp_err_t statusHandler(httpd_req_t *req) {
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  uint32_t clientCount = WiFi.softAPgetStationNum();
+
+  char buf[600];
+
+  snprintf(buf, sizeof(buf),
+    "{\"sd\":%d,\"cardMB\":%u,\"snaps\":%u,"
+    "\"tl\":%d,\"tlInterval\":%u,\"tlCount\":%u,"
+    "\"lightMode\":%u,\"lightLevel\":%u,\"darkThr\":%u,"
+    "\"led\":%d,\"brightness\":%d,"
+    "\"framesize\":%d,\"quality\":%d,"
+    "\"vflip\":%d,\"hmirror\":%d,"
+    "\"heap\":%u,\"psram\":%u,\"uptime\":%u,\"clients\":%u}",
+    (int)sdOK, (unsigned)cardMB, (unsigned)snapNum,
+    (int)tlRunning, (unsigned)tlInterval, (unsigned)tlCount,
+    (unsigned)lightMode, (unsigned)lightLevel,
+    (unsigned)darkThreshold, (int)ledIsOn,
+    (int)lastBrightness,
+    (int)s->status.framesize, (int)s->status.quality,
+    (int)s->status.vflip, (int)s->status.hmirror,
+    (unsigned)ESP.getFreeHeap(),
+    (unsigned)ESP.getFreePsram(),
+    (unsigned)((millis() - bootMillis) / 1000UL),
+    (unsigned)clientCount);
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_sendstr(req, buf);
+}
+
+esp_err_t controlHandler(httpd_req_t *req) {
+  char var[32] = "";
+  char val[20] = "";
+
+  if (!getParam(req, "var", var, sizeof(var)) ||
+      !getParam(req, "val", val, sizeof(val))) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                        "Missing var or val");
+    return ESP_FAIL;
+  }
+
+  char *end = nullptr;
+  long parsed = strtol(val, &end, 10);
+
+  if (end == val || *end != '\0') {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                        "Invalid number");
+    return ESP_FAIL;
+  }
+
+  if (parsed < -1 || parsed > 1000000) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                        "Value out of range");
+    return ESP_FAIL;
+  }
+
+  int v = (int)parsed;
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  int res = 0;
+  bool persistCamera = false;
+  bool persistGeneral = false;
+
+  if (!strcmp(var, "framesize")) {
+    if (v < FRAMESIZE_QVGA || v > maxFrame) res = -1;
+    else {
+      res = s->set_framesize(s, (framesize_t)v);
+      persistCamera = true;
+    }
+  } else if (!strcmp(var, "quality")) {
+    res = s->set_quality(s, constrain(v, 6, 40));
+    persistCamera = true;
+  } else if (!strcmp(var, "vflip")) {
+    res = s->set_vflip(s, v ? 1 : 0);
+    persistCamera = true;
+  } else if (!strcmp(var, "hmirror")) {
+    res = s->set_hmirror(s, v ? 1 : 0);
+    persistCamera = true;
+  } else if (!strcmp(var, "light_mode")) {
+    lightMode = constrain(v, 0, 2);
+    applyLight();
+    persistGeneral = true;
+  } else if (!strcmp(var, "light_level")) {
+    lightLevel = constrain(v, 1, 255);
+    applyLight();
+    persistGeneral = true;
+  } else if (!strcmp(var, "dark_thr")) {
+    darkThreshold = constrain(v, 5, 120);
+    persistGeneral = true;
+  } else if (!strcmp(var, "tl_interval")) {
+    tlInterval = constrain(v, 1, 3600);
+    persistGeneral = true;
+  } else if (!strcmp(var, "tl")) {
+    if (v) {
+      if (!sdOK) res = -1;
+      else {
+        tlCount = 0;
+        tlRunning = true;
+      }
+    } else {
+      tlRunning = false;
+    }
+  } else {
+    res = -1;
+  }
+
+  if (res != 0) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                        "Setting not accepted");
+    return ESP_FAIL;
+  }
+
+  if (persistGeneral) saveSettings();
+
+  if (persistCamera) {
+    prefs.putInt("framesize", (int)s->status.framesize);
+    prefs.putInt("quality", s->status.quality);
+    prefs.putInt("vflip", s->status.vflip);
+    prefs.putInt("hmirror", s->status.hmirror);
+  }
+
+  httpd_resp_set_type(req, "text/plain");
+  return httpd_resp_sendstr(req, "OK");
+}
+
+// ---------------- SD FILE BROWSER ----------------
+esp_err_t listHandler(httpd_req_t *req) {
+  char d[16] = "";
+  getParam(req, "dir", d, sizeof(d));
+
+  bool isTL = !strcmp(d, "timelapse");
+  const char *dirName = isTL ? "timelapse" : "photos";
+  const char *dirPath = isTL ? "/timelapse" : "/photos";
+
+  if (!sdOK || sdLock == nullptr) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                        "SD unavailable");
+    return ESP_FAIL;
+  }
+
+  const int MAXN = 60;
+  String names[MAXN];
+  int total = 0;
+
+  if (xSemaphoreTake(sdLock, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  File dir = SD_MMC.open(dirPath);
+
+  if (dir && dir.isDirectory()) {
+    File f = dir.openNextFile();
+
+    while (f) {
+      if (!f.isDirectory()) {
+        const char *p = strrchr(f.name(), '/');
+        p = p ? p + 1 : f.name();
+
+        // Only list JPEG files generated for this project.
+        if (strstr(p, ".jpg") != nullptr) {
+          names[total % MAXN] = p;
+          total++;
+        }
+      }
+
+      f.close();
+      f = dir.openNextFile();
+    }
+
+    dir.close();
+  }
+
+  xSemaphoreGive(sdLock);
+
+  httpd_resp_set_type(req, "text/html; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+  httpd_resp_sendstr_chunk(req,
+    "<!doctype html><meta charset=utf-8>"
+    "<meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<body style='font-family:system-ui;background:#111;color:#eee;padding:12px'>"
+    "<p><a style='color:#8cf' href='/'>Back to camera</a></p>");
+
+  char line[180];
+  snprintf(line, sizeof(line),
+           "<h3>%s (%d files%s)</h3><ul>",
+           dirName, total, total > MAXN ? ", newest 60 shown" : "");
+
+  httpd_resp_sendstr_chunk(req, line);
+
+  int shown = 0;
+
+  for (int k = total - 1; k >= 0 && shown < MAXN; k--, shown++) {
+    const char *n = names[k % MAXN].c_str();
+
+    // Generated filenames contain only letters, numbers, underscores and dots.
+    snprintf(line, sizeof(line),
+             "<li><a style='color:#8cf' href='/file?d=%s&n=%s'>%s</a></li>",
+             dirName, n, n);
+
+    httpd_resp_sendstr_chunk(req, line);
+  }
+
+  httpd_resp_sendstr_chunk(req, "</ul></body>");
+  return httpd_resp_sendstr_chunk(req, nullptr);
+}
+
+// Stream an SD file in chunks instead of allocating its full size in RAM.
+esp_err_t fileHandler(httpd_req_t *req) {
+  char d[16] = "";
+  char n[48] = "";
+
+  if (!getParam(req, "d", d, sizeof(d)) ||
+      !getParam(req, "n", n, sizeof(n))) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                        "Missing file parameters");
+    return ESP_FAIL;
+  }
+
+  const char *dir =
+    !strcmp(d, "timelapse") ? "/timelapse" :
+    !strcmp(d, "photos") ? "/photos" : nullptr;
+
+  if (!dir) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                        "Invalid directory");
+    return ESP_FAIL;
+  }
+
+  size_t nl = strlen(n);
+
+  if (nl < 5 || strstr(n, "..") || strchr(n, '/') ||
+      strchr(n, '\\') || strcmp(n + nl - 4, ".jpg") != 0) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                        "Invalid filename");
+    return ESP_FAIL;
+  }
+
+  if (!sdOK || sdLock == nullptr ||
+      xSemaphoreTake(sdLock, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  char path[96];
+  snprintf(path, sizeof(path), "%s/%s", dir, n);
+
+  File f = SD_MMC.open(path, FILE_READ);
+
+  if (!f || f.isDirectory()) {
+    if (f) f.close();
+    xSemaphoreGive(sdLock);
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+  }
+
+  httpd_resp_set_type(req, "image/jpeg");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+  uint8_t buffer[2048];
+  esp_err_t result = ESP_OK;
+
+  while (f.available()) {
+    size_t count = f.read(buffer, sizeof(buffer));
+
+    if (count == 0) break;
+
+    result = httpd_resp_send_chunk(
+      req, (const char *)buffer, count);
+
+    if (result != ESP_OK) break;
+    vTaskDelay(1);
+  }
+
+  f.close();
+  xSemaphoreGive(sdLock);
+
+  if (result == ESP_OK) {
+    result = httpd_resp_send_chunk(req, nullptr, 0);
+  }
+
+  return result;
+}
+
+// ---------------- WEB SERVERS ----------------
+void startServers() {
+  httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+
+  cfg.server_port = 80;
+  cfg.stack_size = 8192;
+  cfg.max_uri_handlers = 10;
+  cfg.lru_purge_enable = true;
+
+  if (httpd_start(&mainServer, &cfg) == ESP_OK) {
+    addUri(mainServer, "/", indexHandler);
+    addUri(mainServer, "/capture", captureHandler);
+    addUri(mainServer, "/save", saveHandler);
+    addUri(mainServer, "/status", statusHandler);
+    addUri(mainServer, "/control", controlHandler);
+    addUri(mainServer, "/list", listHandler);
+    addUri(mainServer, "/file", fileHandler);
+  } else {
+    Serial.println("Failed to start control web server.");
+  }
+
+  cfg.server_port = 81;
+  cfg.ctrl_port += 1;
+
+  if (httpd_start(&streamServer, &cfg) == ESP_OK) {
+    addUri(streamServer, "/stream", streamHandler);
+  } else {
+    Serial.println("Failed to start stream server.");
+  }
+}
+
+// ---------------- BACKGROUND TASKS ----------------
+void timelapseTick() {
+  static uint32_t nextShot = 0;
+  static int failures = 0;
+
+  if (!tlRunning) {
+    nextShot = 0;
+    failures = 0;
+    return;
+  }
+
+  uint32_t now = millis();
+
+  if (nextShot != 0 && (int32_t)(now - nextShot) < 0) return;
+
+  nextShot = now + tlInterval * 1000UL;
+
+  char name[64];
+
+  if (savePhoto("/timelapse", "tl", ++tlNum,
+                name, sizeof(name))) {
+    tlCount++;
+    failures = 0;
+    Serial.printf("Timelapse saved: %s\n", name);
+  } else if (++failures >= 5) {
+    Serial.println("Timelapse stopped after repeated save failures.");
+    tlRunning = false;
+  }
+}
+
+void autoLightTick() {
+  static uint32_t nextCheck = 0;
+
+  if (lightMode != LIGHT_AUTO) {
+    nextCheck = 0;
+    return;
+  }
+
+  if (!psramFound()) return;
+
+  uint32_t now = millis();
+
+  if ((int32_t)(now - nextCheck) < 0) return;
+
+  if (!ledIsOn) {
+    int b = measureBrightness();
+    lastBrightness = b;
+
+    if (b >= 0 && b < darkThreshold) setLed(true);
+
+    nextCheck = millis() + 5000;
+  } else {
+    // Turn off briefly to measure room light without the flash.
+    setLed(false);
+    delay(1000);
+
+    int b = measureBrightness();
+    lastBrightness = b;
+
+    if (b < 0 || b < darkThreshold) setLed(true);
+
+    nextCheck = millis() + 60000;
+  }
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  bootMillis = millis();
+  Serial.println();
+  Serial.println("Starting ESP32-CAM Control Station...");
+
+  sdLock = xSemaphoreCreateMutex();
+
+  if (sdLock == nullptr) {
+    Serial.println("Warning: failed to create SD mutex.");
+  }
+
+  // Load saved configuration and increment the boot counter.
+  loadSettings();
+
+  bootNum = prefs.getUInt("boot", 0) + 1;
+  prefs.putUInt("boot", bootNum);
+
+  // Camera setup
+  camera_config_t config = {};
+
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 2;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    config.grab_mode = CAMERA_GRAB_LATEST;
+    maxFrame = FRAMESIZE_UXGA;
+  } else {
+    config.frame_size = FRAMESIZE_CIF;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+    config.fb_location = CAMERA_FB_IN_DRAM;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+    maxFrame = FRAMESIZE_VGA;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+
+  if (err != ESP_OK) {
+    Serial.printf("Camera initialization failed: 0x%x\n", err);
+    Serial.println("Check the board model and camera ribbon cable.");
+    delay(5000);
+    ESP.restart();
+  }
+
+  sensor_t *sensor = esp_camera_sensor_get();
+
+  if (sensor) loadCameraSettings(sensor);
+
+  // Initialize storage and flash.
+  initSD();
+  initFlashPWM();
+  setLed(false);
+
+  // Start the ESP32 access point.
+  WiFi.mode(WIFI_AP);
+
+  if (!WiFi.softAPConfig(apIP, apGateway, apSubnet)) {
+    Serial.println("Warning: AP IP configuration failed.");
+  }
+
+  if (!WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 4)) {
+    Serial.println("Warning: Wi-Fi access point failed to start.");
+  }
+
+  WiFi.setSleep(false);
+
+  startServers();
+
+  Serial.println();
+  Serial.println("==================================");
+  Serial.println("ESP32-CAM is starting");
+  Serial.print("Wi-Fi name: ");
+  Serial.println(AP_SSID);
+  Serial.print("Wi-Fi password: ");
+  Serial.println(AP_PASS);
+  Serial.print("Control panel: http://");
+  Serial.println(WiFi.softAPIP());
+  Serial.println("Stream: http://192.168.4.1:81/stream");
+  Serial.println("==================================");
+
+  delay(2000);
+}
+
+// ---------------- MAIN LOOP ----------------
+void loop() {
+  timelapseTick();
+  autoLightTick();
+  delay(20);
+}
